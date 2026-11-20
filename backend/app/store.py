@@ -266,6 +266,243 @@ class SnapshotEngine:
         return {"total_snapshots": len(self._snapshots), "by_module": by_module, "total_diffs": len(self._diff_logs)}
 
 
+class PartitionBaselineRegistry:
+    """分区恢复基线注册表：按「目标表 + 模型版本 + 日期分区」登记可回滚基线。
+
+    只有通过模型发布记录与目标表首落分区校验的基线才具备回滚资格；
+    其他模型的同名分区、首轮只写了一半的数据均不予登记。
+    """
+
+    def __init__(self) -> None:
+        # 模型发布记录：记录每次发布落在哪些目标表、写入了哪些日期分区
+        self._release_records: dict[str, dict[str, Any]] = {}
+        # 目标表首落分区数据（实际落地行数），用于首轮完整性校验
+        self._first_landings: dict[str, dict[str, Any]] = {}
+        # 已登记的恢复基线，key = (目标表, 模型版本, 日期分区)
+        self._baselines: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # 已登记的完整快照：snap_id -> 覆盖的 (目标表, 日期分区) 集合
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        # 回写执行记录
+        self._rollback_records: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # 模型发布记录与首落分区数据
+    # ------------------------------------------------------------------
+
+    def record_release(
+        self,
+        release_id: str,
+        target_table: str,
+        model_version: str,
+        partitions: list[str],
+    ) -> dict[str, Any]:
+        """登记一条模型发布记录，标明本次发布覆盖的目标表与日期分区。"""
+        record = {
+            "release_id": release_id,
+            "target_table": target_table,
+            "model_version": model_version,
+            "partitions": list(partitions),
+            "released_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._release_records[release_id] = record
+        return record
+
+    def get_release(self, release_id: str) -> dict[str, Any] | None:
+        return self._release_records.get(release_id)
+
+    def releases_for(self, target_table: str) -> list[dict[str, Any]]:
+        return [
+            r for r in self._release_records.values()
+            if _table_matches(r["target_table"], target_table)
+        ]
+
+    def record_first_landing(
+        self,
+        target_table: str,
+        model_version: str,
+        date_partition: str,
+        *,
+        actual_rows: int,
+        expected_rows: int,
+        source_model: str,
+    ) -> dict[str, Any]:
+        """登记目标表某个日期分区首次落下的数据及行数校验依据。"""
+        key = f"{target_table}|{model_version}|{date_partition}"
+        landing = {
+            "target_table": target_table,
+            "model_version": model_version,
+            "date_partition": date_partition,
+            "actual_rows": actual_rows,
+            "expected_rows": expected_rows,
+            "source_model": source_model,
+            "complete": actual_rows >= expected_rows and expected_rows > 0,
+            "landed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._first_landings[key] = landing
+        return landing
+
+    def get_first_landing(
+        self, target_table: str, model_version: str, date_partition: str,
+    ) -> dict[str, Any] | None:
+        return self._first_landings.get(f"{target_table}|{model_version}|{date_partition}")
+
+    # ------------------------------------------------------------------
+    # 恢复基线登记与查询
+    # ------------------------------------------------------------------
+
+    def register_baseline(
+        self,
+        target_table: str,
+        model_version: str,
+        date_partition: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """登记一条分区恢复基线；同一识别键重复登记返回既有基线。"""
+        key = (target_table, model_version, date_partition)
+        existing = self._baselines.get(key)
+        if existing is not None:
+            return existing
+        baseline = {
+            "baseline_id": f"BL-{uuid.uuid4().hex[:10].upper()}",
+            "target_table": target_table,
+            "model_version": model_version,
+            "date_partition": date_partition,
+            "eligible": bool(metadata.get("eligible", False)),
+            "source_release": metadata.get("source_release", ""),
+            "actual_rows": metadata.get("actual_rows", 0),
+            "expected_rows": metadata.get("expected_rows", 0),
+            "snapshot_id": None,
+            "snapshot_complete": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "reason": metadata.get("reason", ""),
+        }
+        self._baselines[key] = baseline
+        return baseline
+
+    def get_baseline(
+        self, target_table: str, model_version: str, date_partition: str,
+    ) -> dict[str, Any] | None:
+        return self._baselines.get((target_table, model_version, date_partition))
+
+    def list_baselines(
+        self, target_table: str | None = None, model_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = list(self._baselines.values())
+        if target_table:
+            rows = [r for r in rows if _table_matches(target_table, r["target_table"])]
+        if model_version:
+            rows = [r for r in rows if r["model_version"] == model_version]
+        return rows
+
+    def eligible_baselines(
+        self, target_table: str, model_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            r for r in self._baselines.values()
+            if r["eligible"] and r["snapshot_complete"]
+            and _table_matches(target_table, r["target_table"])
+        ]
+        if model_version:
+            rows = [r for r in rows if r["model_version"] == model_version]
+        return rows
+
+    # ------------------------------------------------------------------
+    # 完整快照登记：部署流水线只能回写快照标明的表和分区
+    # ------------------------------------------------------------------
+
+    def register_snapshot(
+        self,
+        snapshot_id: str,
+        target_table: str,
+        model_version: str,
+        partitions: list[str],
+    ) -> dict[str, Any]:
+        """登记一份完整快照，并回写其覆盖基线的快照状态。"""
+        covered = {(target_table, p) for p in partitions}
+        snapshot = {
+            "snapshot_id": snapshot_id,
+            "target_table": target_table,
+            "model_version": model_version,
+            "partitions": list(partitions),
+            "covered": covered,
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._snapshots[snapshot_id] = snapshot
+
+        missing: list[str] = []
+        for baseline in self._baselines.values():
+            if not baseline["eligible"]:
+                continue
+            if baseline["model_version"] != model_version:
+                continue
+            if not _table_matches(target_table, baseline["target_table"]):
+                continue
+            # 目标表（含通配策略）与日期分区同时被快照覆盖才挂接
+            if baseline["date_partition"] in partitions:
+                baseline["snapshot_id"] = snapshot_id
+                baseline["snapshot_complete"] = True
+            else:
+                missing.append(baseline["date_partition"])
+        snapshot["missing_partitions"] = sorted(set(missing))
+        return snapshot
+
+    def get_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        return self._snapshots.get(snapshot_id)
+
+    def list_snapshots(self, target_table: str | None = None) -> list[dict[str, Any]]:
+        rows = list(self._snapshots.values())
+        if target_table:
+            rows = [r for r in rows if _table_matches(target_table, r["target_table"])]
+        return rows
+
+    # ------------------------------------------------------------------
+    # 回写执行记录
+    # ------------------------------------------------------------------
+
+    def add_rollback_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        rollback_id = f"RB-{uuid.uuid4().hex[:10].upper()}"
+        entry = {"rollback_id": rollback_id, **record,
+                 "rolled_back_at": datetime.now(timezone.utc).isoformat()}
+        self._rollback_records[rollback_id] = entry
+        return entry
+
+    def get_rollback_record(self, rollback_id: str) -> dict[str, Any] | None:
+        return self._rollback_records.get(rollback_id)
+
+    def list_rollback_records(self, target_table: str | None = None) -> list[dict[str, Any]]:
+        rows = list(self._rollback_records.values())
+        if target_table:
+            rows = [r for r in rows if _table_matches(target_table, r["target_table"])]
+        return rows
+
+    def baseline_summary(self) -> dict[str, Any]:
+        eligible = sum(1 for b in self._baselines.values() if b["eligible"])
+        snap_ready = sum(
+            1 for b in self._baselines.values()
+            if b["eligible"] and b["snapshot_complete"]
+        )
+        return {
+            "release_records": len(self._release_records),
+            "first_landings": len(self._first_landings),
+            "baselines": len(self._baselines),
+            "eligible_baselines": eligible,
+            "snapshot_ready_baselines": snap_ready,
+            "snapshots": len(self._snapshots),
+            "rollback_records": len(self._rollback_records),
+        }
+
+
+def _table_matches(pattern: str, actual: str) -> bool:
+    """目标表匹配：精确相等，或 pattern 以 * 结尾时按前缀匹配。"""
+    if pattern == actual:
+        return True
+    if pattern.endswith("*"):
+        return actual.startswith(pattern[:-1])
+    if actual.endswith("*"):
+        return pattern.startswith(actual[:-1])
+    return False
+
+
 class ArtifactRegistry:
     """数据产物注册表：追踪各模块产出的数据工件。"""
 
@@ -325,6 +562,7 @@ class Store:
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        self.partition_baselines = PartitionBaselineRegistry()
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -361,6 +599,7 @@ class Store:
         recovery = self.recovery.recovery_summary()
         snapshot_info = self.snapshot.snapshot_summary()
         artifact_info = self.artifacts.artifact_summary()
+        baseline_info = self.partition_baselines.baseline_summary()
         return {
             "cards": cards,
             "modules": modules,
@@ -368,6 +607,7 @@ class Store:
             "recovery": recovery,
             "snapshots": snapshot_info,
             "artifacts": artifact_info,
+            "partition_baselines": baseline_info,
         }
 
 

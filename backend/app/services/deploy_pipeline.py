@@ -13,9 +13,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.partition_baseline import PartitionBaselineService
 from app.store import store
 
 ENVIRONMENTS = {"开发", "预发", "生产", "灰度"}
+
+# 分区恢复基线领域服务：部署成功登记发布记录，回滚时选择可回滚版本与快照。
+baseline_service = PartitionBaselineService()
 
 
 class DeployPipelineService(BaseModuleService):
@@ -108,14 +112,24 @@ class DeployPipelineService(BaseModuleService):
             entry["pending"] = False
 
             # 发布部署成功事件，触发snapshot_plan生成快照
-            store.channel.publish("deploy.published", {
+            published_payload = {
                 "task_name": entry["任务名称"],
                 "target_model": target_model,
                 "environment": entry.get("部署环境", ""),
                 "deployed_at": datetime.now(timezone.utc).isoformat(),
                 "source_version": check_result.get("current_version", "v1.0"),
                 "entry_id": entry_id,
-            })
+            }
+            store.channel.publish("deploy.published", published_payload)
+
+            # 登记模型发布记录，作为分区恢复基线的发布侧校验依据
+            baseline_service.record_model_release(
+                release_id=f"REL-{entry_id}",
+                target_table=target_model,
+                model_version=check_result.get("current_version", "v1.0"),
+                partitions=[],
+                source_model=target_model,
+            )
 
             # 创建部署检查点用于恢复
             cp_id = store.recovery.create_checkpoint("deploy_pipeline", f"deploy_{entry_id}", {
@@ -126,19 +140,25 @@ class DeployPipelineService(BaseModuleService):
             store.recovery.mark_completed(cp_id)
 
         elif action == "触发回滚":
-            # 回滚到上一版本
+            # 回滚到上一版本：优先走分区恢复基线，缺少基线时保留原有方案
             rollback_result = _execute_rollback(entry)
             entry["status"] = "已回滚"
             entry["部署状态"] = f"已回滚至{rollback_result.get('rollback_version', '上一版本')}"
             entry["执行日志"] = f"回滚原因: {rollback_result.get('reason', '手动触发')}"
             entry["pending"] = True
             entry["abnormal"] = True
+            if rollback_result.get("rollback_id"):
+                entry["回滚明细编号"] = rollback_result["rollback_id"]
+                entry["回滚快照编号"] = "/".join(rollback_result.get("snapshot_ids", []))
+                entry["回写日期分区"] = "/".join(rollback_result.get("written_partitions", []))
 
             store.channel.publish("deploy.rollback", {
                 "task_name": entry["任务名称"],
                 "target_model": target_model,
                 "rollback_to": rollback_result.get("rollback_version"),
                 "entry_id": entry_id,
+                "snapshot_ids": rollback_result.get("snapshot_ids", []),
+                "written_partitions": rollback_result.get("written_partitions", []),
             })
 
         return entry, message
@@ -250,6 +270,42 @@ def _mock_etl_check(target_model: str) -> bool:
 
 
 def _execute_rollback(entry: dict[str, Any]) -> dict[str, Any]:
-    """执行回滚操作。"""
-    return {"rollback_version": "v0.9", "reason": "校验未通过，手动触发回滚",
-            "rolled_back_at": datetime.now(timezone.utc).isoformat()}
+    """执行回滚操作。
+
+    目标表存在分区恢复基线时，按基线选择可回滚版本并执行分区写回，
+    回滚明细携带实际快照编号与写回的日期分区；否则保留原有版本回退方案。
+    """
+    target_model = str(entry.get("目标模型", ""))
+    fallback = {
+        "rollback_version": "v0.9",
+        "reason": "校验未通过，手动触发回滚",
+        "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_ids": [],
+        "written_partitions": [],
+    }
+    if not target_model:
+        return fallback
+
+    candidate = baseline_service.select_rollback_candidate(target_model, "v1.0")
+    if not candidate["rollbackable"]:
+        return fallback
+
+    result = baseline_service.execute_rollback(
+        target_table=target_model,
+        current_version=candidate["requested_version"],
+        reason="校验未通过，部署流水线触发回滚",
+    )
+    if not result["ok"] or not result.get("rollback"):
+        return fallback
+
+    rollback = result["rollback"]
+    return {
+        "rollback_id": rollback["rollback_id"],
+        "rollback_version": rollback["restored_model_version"],
+        "reason": rollback["reason"],
+        "rolled_back_at": rollback["rolled_back_at"],
+        "snapshot_ids": rollback["snapshot_ids"],
+        "written_partitions": rollback["written_partitions"],
+        "leftover_partitions": rollback["leftover_partitions"],
+        "fallback_to_previous": rollback["fallback"],
+    }

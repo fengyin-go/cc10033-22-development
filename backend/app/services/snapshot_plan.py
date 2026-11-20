@@ -13,11 +13,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.partition_baseline import PartitionBaselineService
 from app.store import store
 
 VALID_CYCLES = {"每分钟", "每小时", "每次变更", "每日", "每周", "每月", "每季度"}
 PARTITION_FORMATS = {"ds=yyyyMMdd", "hour=yyyyMMddHH", "week=yyyyWW", "version=yyyyMMddHHmmss",
                      "year=yyyy", "month=yyyyMM"}
+
+# 分区恢复基线：快照计划只有登记完整快照后，部署流水线才能按标明的表和分区回写。
+baseline_service = PartitionBaselineService()
 
 
 class SnapshotPlanService(BaseModuleService):
@@ -106,6 +110,21 @@ class SnapshotPlanService(BaseModuleService):
             # 创建初始快照
             cycle = entry.get("快照周期", "每日")
             initial_snap = _create_initial_snapshot(entry)
+
+            # 登记完整快照：只有挂接上可回滚基线后，部署流水线才能按快照
+            # 标明的目标表和日期分区执行回写；缺分区的基线保持不可回写。
+            target_table = str(entry.get("目标表", ""))
+            existing_baselines = baseline_service.list_baselines(target_table)
+            if existing_baselines:
+                version = str(existing_baselines[0]["model_version"])
+                partitions = sorted({b["date_partition"] for b in existing_baselines})
+                baseline_service.register_complete_snapshot(
+                    snapshot_id=str(initial_snap),
+                    target_table=target_table,
+                    model_version=version,
+                    partitions=partitions,
+                )
+
             store.channel.publish("snapshot.enabled", {
                 "strategy_name": entry["策略名称"],
                 "target_table": target_table,
@@ -151,6 +170,9 @@ class SnapshotPlanService(BaseModuleService):
         # 自动快照统计
         snapshot_info = store.snapshot.snapshot_summary()
         base["auto_snapshots"] = snapshot_info.get("total_snapshots", 0)
+
+        # 分区恢复基线挂接情况
+        base["partition_baselines"] = baseline_service.summary()
         return base
 
 
